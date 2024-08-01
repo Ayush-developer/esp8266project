@@ -1,8 +1,11 @@
 #include <ESP8266WiFi.h>
 #include <ESPAsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Servo.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-// Replace with your network credentials
 const char* ssid = "OPPO";
 const char* password = "b82iwjnr";
 
@@ -10,16 +13,29 @@ const char* http_username = "admin";
 const char* http_password = "admin";
 
 const char* PARAM_INPUT_1 = "state";
+const char* PARAM_INPUT_2 = "rgb";
 
-const int output = 2;
+const int servoPin = 4; 
+const int pirPin = 14; 
+const int dhtPin = 12; 
+const int redPin = 13; 
+const int greenPin = 15; 
+const int bluePin = 5; 
+const int buzzerPin = 0; 
+const int lcdAddress = 0x27;
 
-// Create AsyncWebServer object on port 80
+Servo doorServo;
+DHT dht(dhtPin, DHT11);
+LiquidCrystal_I2C lcd(lcdAddress, 16, 2);
+
 AsyncWebServer server(80);
+
+bool isAuthenticated = false;
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
 <head>
-  <title>ESP Password Protected Web Server</title>
+  <title>Home Automation</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     html {font-family: New Times Roman; display: inline-block; text-align: center;}
@@ -34,22 +50,36 @@ const char index_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <h2>ESP Password Protected Web Server</h2>
-  <p> GPIO2 State: <span id="state">%STATE%</span></p>
-    <button onclick="logoutButton()">Logout</button>
+  <h2>Home Automation</h2>
+  <p>Door State: <span id="state">%STATE%</span></p>
+  <p>RGB Light:</p>
+  <button onclick="sendRGB('r')">Red</button>
+  <button onclick="sendRGB('g')">Green</button>
+  <button onclick="sendRGB('b')">Blue</button>
+  <button onclick="sendRGB('off')">Off</button>
+  <br><br>
+  <button onclick="logoutButton()">Logout</button>
   %BUTTONPLACEHOLDER%
-<script>function toggleCheckbox(element) {
+<script>
+function sendRGB(color) {
+  var xhr = new XMLHttpRequest();
+  xhr.open("GET", "/update_rgb?rgb=" + color, true);
+  xhr.send();
+}
+
+function toggleCheckbox(element) {
   var xhr = new XMLHttpRequest();
   if(element.checked){ 
     xhr.open("GET", "/update?state=1", true); 
-    document.getElementById("state").innerHTML = "ON";  
+    document.getElementById("state").innerHTML = "OPEN";  
   }
   else { 
     xhr.open("GET", "/update?state=0", true); 
-    document.getElementById("state").innerHTML = "OFF";      
+    document.getElementById("state").innerHTML = "CLOSED";      
   }
   xhr.send();
 }
+
 function logoutButton() {
   var xhr = new XMLHttpRequest();
   xhr.open("GET", "/logout", true);
@@ -73,9 +103,7 @@ const char logout_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// Replaces placeholder with button section in your web page
 String processor(const String& var){
-  //Serial.println(var);
   if(var == "BUTTONPLACEHOLDER"){
     String buttons ="";
     String outputStateValue = outputState();
@@ -83,18 +111,18 @@ String processor(const String& var){
     return buttons;
   }
   if (var == "STATE"){
-    if(digitalRead(output)){
-      return "ON";
+    if(doorServo.read() == 90){
+      return "OPEN";
     }
     else {
-      return "OFF";
+      return "CLOSED";
     }
   }
   return String();
 }
 
 String outputState(){
-  if(digitalRead(output)){
+  if(doorServo.read() == 90){
     return "checked";
   }
   else {
@@ -104,30 +132,41 @@ String outputState(){
 }
 
 void setup(){
-  // Serial port for debugging purposes
   Serial.begin(115200);
 
-  pinMode(output, OUTPUT);
-  digitalWrite(output, LOW);
-  
-  // Connect to Wi-Fi
+  doorServo.attach(servoPin);
+  doorServo.write(0);
+
+  dht.begin();
+
+  lcd.begin();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(pirPin, INPUT);
+
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
     Serial.println("Connecting to WiFi..");
   }
 
-  // Print ESP Local IP Address
   Serial.println(WiFi.localIP());
 
-  // Route for root / web page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     if(!request->authenticate(http_username, http_password))
       return request->requestAuthentication();
+    isAuthenticated = true;
     request->send_P(200, "text/html", index_html, processor);
   });
-    
+
   server.on("/logout", HTTP_GET, [](AsyncWebServerRequest *request){
+    isAuthenticated = false;
     request->send(401);
   });
 
@@ -135,30 +174,74 @@ void setup(){
     request->send_P(200, "text/html", logout_html, processor);
   });
 
-  // Send a GET request to <ESP_IP>/update?state=<inputMessage>
-  server.on("/update", HTTP_GET, [] (AsyncWebServerRequest *request) {
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
     if(!request->authenticate(http_username, http_password))
       return request->requestAuthentication();
     String inputMessage;
     String inputParam;
-    // GET input1 value on <ESP_IP>/update?state=<inputMessage>
     if (request->hasParam(PARAM_INPUT_1)) {
       inputMessage = request->getParam(PARAM_INPUT_1)->value();
       inputParam = PARAM_INPUT_1;
-      digitalWrite(output, inputMessage.toInt());
-    }
-    else {
+      if(inputMessage == "1" && digitalRead(pirPin) == HIGH) {
+        doorServo.write(90);
+        float temperature = dht.readTemperature();
+        lcd.setCursor(0, 0);
+        lcd.print("Temp: " + String(temperature) + " C");
+        lcd.setCursor(0, 1);
+        lcd.print("Welcome Home");
+      } else {
+        doorServo.write(0);
+      }
+    } else {
       inputMessage = "No message sent";
       inputParam = "none";
     }
     Serial.println(inputMessage);
     request->send(200, "text/plain", "OK");
   });
-  
-  // Start server
+
+  server.on("/update_rgb", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if(!request->authenticate(http_username, http_password))
+      return request->requestAuthentication();
+    String color;
+    if (request->hasParam(PARAM_INPUT_2)) {
+      color = request->getParam(PARAM_INPUT_2)->value();
+      if(color == "r") {
+        analogWrite(redPin, 255);
+        analogWrite(greenPin, 0);
+        analogWrite(bluePin, 0);
+      } else if(color == "g") {
+        analogWrite(redPin, 0);
+        analogWrite(greenPin, 255);
+        analogWrite(bluePin, 0);
+      } else if(color == "b") {
+        analogWrite(redPin, 0);
+        analogWrite(greenPin, 0);
+        analogWrite(bluePin, 255);
+      } else if(color == "off") {
+        analogWrite(redPin, 0);
+        analogWrite(greenPin, 0);
+        analogWrite(bluePin, 0);
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
   server.begin();
 }
-  
+
 void loop() {
-  
+  float temperature = dht.readTemperature();
+  if(temperature > 30) {
+    digitalWrite(buzzerPin, HIGH);
+    lcd.setCursor(0, 0);
+    lcd.print("FIRE! Temp: " + String(temperature) + " C");
+    lcd.setCursor(0, 1);
+    lcd.print("FIRE! FIRE! FIRE!");
+    analogWrite(redPin, 255);
+    analogWrite(greenPin, 0);
+    analogWrite(bluePin, 0);
+  } else {
+    digitalWrite(buzzerPin, LOW);
+  }
 }
